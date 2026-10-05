@@ -108,7 +108,7 @@ impl Balloon {
                 #[cfg(target_os = "linux")]
                 let advice = libc::MADV_DONTNEED;
                 #[cfg(target_os = "macos")]
-                let advice = libc::MADV_FREE_REUSABLE;
+                let advice = libc::MADV_FREE;
                 #[cfg(unix)]
                 unsafe {
                     libc::madvise(

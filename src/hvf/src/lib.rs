@@ -330,6 +330,10 @@ pub enum VcpuExit<'a> {
 struct ReclaimEntry {
     host: u64,
     len: u64,
+    // Already remapped by a vCPU. Kept so that a second vCPU that faulted on
+    // the same range before the remap retries instead of falling through to
+    // MMIO dispatch. Dropped when the guest reports the range free again.
+    mapped: bool,
 }
 
 static RECLAIMED: OnceLock<Mutex<BTreeMap<u64, ReclaimEntry>>> = OnceLock::new();
@@ -368,6 +372,16 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     // The lock is held across unmap/insert so a concurrent vCPU refault of a
     // neighboring entry serializes with us.
     let mut map = reclaimed_map().lock().unwrap();
+    // Remapped entries only exist to absorb racing refaults; a new report over
+    // them means the guest freed that memory again, so they can go.
+    let stale: Vec<u64> = map
+        .range(..end)
+        .filter(|&(&s, e)| e.mapped && s + e.len > start)
+        .map(|(&s, _)| s)
+        .collect();
+    for s in stale {
+        map.remove(&s);
+    }
     // Entries are disjoint; refuse a report overlapping an outstanding entry
     // (double hv_vm_unmap would fail and split bookkeeping).
     if map
@@ -382,14 +396,51 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
         error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
         return;
     }
-    // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
-    // drops them from phys_footprint immediately.
-    #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
-    #[cfg(not(target_os = "macos"))]
-    let advice = libc::MADV_DONTNEED;
-    unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
-    map.insert(start, ReclaimEntry { host, len: alen });
+    // With the stage-2 mapping gone, replace the host pages with a fresh
+    // anonymous zero-fill mapping at the same address. madvise is not enough
+    // on macOS: MADV_FREE_REUSABLE marks the pages reusable (and drops them
+    // from phys_footprint) but the guest-written pages stay dirty in their VM
+    // object and macOS compresses other memory before discarding them.
+    // Replacing the mapping frees the old pages outright, keeps the address
+    // valid for device threads, and the guest may not assume anything about
+    // the contents of a reported range, so zero pages are fine.
+    let p = unsafe {
+        libc::mmap(
+            host as *mut libc::c_void,
+            alen as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED || p as u64 != host {
+        // Leave the range as it was: map it back and don't record it.
+        error!(
+            "balloon reclaim: mmap(0x{host:x}, {alen}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let ret = unsafe {
+            hv_vm_map(
+                host as *mut core::ffi::c_void,
+                start,
+                alen as usize,
+                (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
+            )
+        };
+        if ret != HV_SUCCESS {
+            panic!("balloon reclaim: hv_vm_map(0x{start:x}, {alen}) failed: {ret:x}");
+        }
+        return;
+    }
+    map.insert(
+        start,
+        ReclaimEntry {
+            host,
+            len: alen,
+            mapped: false,
+        },
+    );
 }
 
 /// If `pa` falls inside a reclaimed range, remap the whole range and return
@@ -398,12 +449,16 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
 /// walked PA the same way).
 fn balloon_remap_if_reclaimed(pa: u64) -> bool {
     let mut map = reclaimed_map().lock().unwrap();
-    let (&gpa, entry) = match map.range(..=pa).next_back() {
+    let (&gpa, entry) = match map.range_mut(..=pa).next_back() {
         Some(e) => e,
         None => return false,
     };
     if pa >= gpa + entry.len {
         return false;
+    }
+    if entry.mapped {
+        // Another vCPU remapped it after we faulted; just retry.
+        return true;
     }
     let ret = unsafe {
         hv_vm_map(
@@ -421,7 +476,7 @@ fn balloon_remap_if_reclaimed(pa: u64) -> bool {
             entry.len
         );
     }
-    map.remove(&gpa);
+    entry.mapped = true;
     true
 }
 

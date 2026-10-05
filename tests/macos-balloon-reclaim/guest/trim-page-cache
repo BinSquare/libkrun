@@ -1,0 +1,8 @@
+#!/bin/sh
+# Keep the page cache at ~1 GB (memory.reclaim drops cold pages first) and compact
+# free memory into 2 MB blocks, the granularity free-page reporting works at.
+cache=$(awk '/^(Buffers|Cached):/{s+=$2} /^Shmem:/{s-=$2} END{print int(s/1024)}' /proc/meminfo)
+excess=$((cache - 1024))
+[ "$excess" -gt 64 ] && echo "${excess}M" > /sys/fs/cgroup/memory.reclaim 2>/dev/null
+echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+exit 0

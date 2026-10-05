@@ -1,0 +1,5 @@
+[Unit]
+Description=Trim page cache so the balloon can return memory to the host
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/trim-page-cache
