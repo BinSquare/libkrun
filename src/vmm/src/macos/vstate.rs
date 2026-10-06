@@ -121,6 +121,9 @@ impl Vm {
                 region.start_addr().raw_value(),
                 region.len()
             );
+            if hvf::balloon_reclaim_enabled() {
+                hvf::balloon_note_guest_ram(region.start_addr().raw_value(), region.len());
+            }
             self.hvf_vm
                 .map_memory(
                     host_addr as u64,

@@ -334,6 +334,28 @@ struct ReclaimEntry {
 
 static RECLAIMED: OnceLock<Mutex<BTreeMap<u64, ReclaimEntry>>> = OnceLock::new();
 
+/// Guest RAM regions (start -> len), as mapped at VM creation. A fault on guest
+/// RAM is only ever a reclaimed range (see balloon_remap_if_reclaimed).
+static GUEST_RAM: OnceLock<Mutex<BTreeMap<u64, u64>>> = OnceLock::new();
+
+fn guest_ram() -> &'static Mutex<BTreeMap<u64, u64>> {
+    GUEST_RAM.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Record a guest RAM region (called for each region when guest memory is set up).
+pub fn balloon_note_guest_ram(gpa: u64, len: u64) {
+    guest_ram().lock().unwrap().insert(gpa, len);
+}
+
+fn is_guest_ram(pa: u64) -> bool {
+    guest_ram()
+        .lock()
+        .unwrap()
+        .range(..=pa)
+        .next_back()
+        .is_some_and(|(&start, &len)| pa < start + len)
+}
+
 fn reclaimed_map() -> &'static Mutex<BTreeMap<u64, ReclaimEntry>> {
     RECLAIMED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -396,30 +418,33 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
 /// true so the vCPU retries the faulting instruction. Also covers stage-1
 /// page-table walks that land in reclaimed memory (s1ptw aborts report the
 /// walked PA the same way).
+///
+/// A fault on guest RAM that is no longer in the map was remapped by another
+/// vCPU between this vCPU's fault and now (several vCPUs touching one reclaimed
+/// range at once). It must be retried too: falling through to MMIO dispatch
+/// would emulate a RAM access against an empty bus, so a load returns zero and
+/// a store is dropped, silently corrupting guest memory.
 fn balloon_remap_if_reclaimed(pa: u64) -> bool {
     let mut map = reclaimed_map().lock().unwrap();
-    let (&gpa, entry) = match map.range(..=pa).next_back() {
-        Some(e) => e,
-        None => return false,
+    let (gpa, host, len) = match map.range(..=pa).next_back() {
+        Some((&gpa, entry)) if pa < gpa + entry.len => (gpa, entry.host, entry.len),
+        _ => {
+            drop(map);
+            return is_guest_ram(pa);
+        }
     };
-    if pa >= gpa + entry.len {
-        return false;
-    }
     let ret = unsafe {
         hv_vm_map(
-            entry.host as *mut core::ffi::c_void,
+            host as *mut core::ffi::c_void,
             gpa,
-            entry.len as usize,
+            len as usize,
             (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
         )
     };
     if ret != HV_SUCCESS {
         // Falling through to MMIO dispatch would corrupt the guest; this is
         // unrecoverable state, surface it loudly.
-        panic!(
-            "balloon refault: hv_vm_map(0x{gpa:x}, {}) failed: {ret:x}",
-            entry.len
-        );
+        panic!("balloon refault: hv_vm_map(0x{gpa:x}, {len}) failed: {ret:x}");
     }
     map.remove(&gpa);
     true
