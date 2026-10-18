@@ -21,6 +21,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -390,28 +391,137 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     // The lock is held across unmap/insert so a concurrent vCPU refault of a
     // neighboring entry serializes with us.
     let mut map = reclaimed_map().lock().unwrap();
-    // Entries are disjoint; refuse a report overlapping an outstanding entry
-    // (double hv_vm_unmap would fail and split bookkeeping).
-    if map
+    // Outstanding entries this report overlaps. The guest re-reports a block
+    // once it merges with a newly freed buddy, so a report often covers a range
+    // released earlier plus memory freed since: release only the parts not yet
+    // released (a second hv_vm_unmap of a range would fail), then merge it all
+    // into one entry. Refusing the whole report instead left the newly freed
+    // part held by the host for good, since the guest considers it reported.
+    let mut overlapping: Vec<(u64, u64, u64)> = map
         .range(..end)
-        .next_back()
-        .is_some_and(|(&prev_start, prev)| prev_start + prev.len > start)
-    {
-        return;
+        .rev()
+        .take_while(|&(&s, e)| s + e.len > start)
+        .map(|(&s, e)| (s, e.host, e.len))
+        .collect();
+    overlapping.reverse();
+    let mut gaps: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = start;
+    for &(s, _, l) in &overlapping {
+        if s > cursor {
+            gaps.push((cursor, s));
+        }
+        cursor = cursor.max(s + l);
     }
-    let ret = unsafe { hv_vm_unmap(start, alen as usize) };
-    if ret != HV_SUCCESS {
-        error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
-        return;
+    if cursor < end {
+        gaps.push((cursor, end));
     }
-    // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
-    // drops them from phys_footprint immediately.
-    #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
-    #[cfg(not(target_os = "macos"))]
-    let advice = libc::MADV_DONTNEED;
-    unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
-    map.insert(start, ReclaimEntry { host, len: alen });
+    let mut released: Vec<(u64, u64)> = Vec::new();
+    for &(a, b) in &gaps {
+        let ret = unsafe { hv_vm_unmap(a, (b - a) as usize) };
+        if ret != HV_SUCCESS {
+            error!(
+                "balloon reclaim: hv_vm_unmap(0x{a:x}, {}) failed: {ret:x}",
+                b - a
+            );
+            break;
+        }
+        // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
+        // drops them from phys_footprint immediately (compressed ones included).
+        #[cfg(target_os = "macos")]
+        let advice = libc::MADV_FREE_REUSABLE;
+        #[cfg(not(target_os = "macos"))]
+        let advice = libc::MADV_DONTNEED;
+        unsafe {
+            libc::madvise(
+                (host + (a - start)) as *mut libc::c_void,
+                (b - a) as usize,
+                advice,
+            )
+        };
+        released.push((a, b));
+    }
+    let freed: u64 = released.iter().map(|&(a, b)| b - a).sum();
+    RECLAIM_STATS.reports.fetch_add(1, Ordering::Relaxed);
+    RECLAIM_STATS.released.fetch_add(freed, Ordering::Relaxed);
+    RECLAIM_STATS.already.fetch_add(
+        alen - gaps.iter().map(|&(a, b)| b - a).sum::<u64>(),
+        Ordering::Relaxed,
+    );
+    if released.len() == gaps.len() {
+        // All of [start, end) is now unmapped, and so are the overlapping
+        // entries: one entry for the union (contiguous, since the report spans
+        // the gaps between them).
+        let (mut ns, mut ne, mut nh) = (start, end, host);
+        if let Some(&(s, h, _)) = overlapping.first()
+            && s < ns
+        {
+            ns = s;
+            nh = h;
+        }
+        if let Some(&(s, _, l)) = overlapping.last() {
+            ne = ne.max(s + l);
+        }
+        for &(s, _, _) in &overlapping {
+            map.remove(&s);
+        }
+        map.insert(
+            ns,
+            ReclaimEntry {
+                host: nh,
+                len: ne - ns,
+            },
+        );
+    } else {
+        // An unmap failed: record what was released, each on its own (they are
+        // disjoint from the outstanding entries by construction).
+        for &(a, b) in &released {
+            map.insert(
+                a,
+                ReclaimEntry {
+                    host: host + (a - start),
+                    len: b - a,
+                },
+            );
+        }
+    }
+    drop(map);
+    RECLAIM_STATS.log_now_and_then();
+}
+
+/// Counters for the libkrun log, to see free-page reclaim at work.
+struct ReclaimStats {
+    reports: AtomicU64,
+    released: AtomicU64,
+    already: AtomicU64,
+    refaults: AtomicU64,
+    last_log: Mutex<Option<std::time::Instant>>,
+}
+
+static RECLAIM_STATS: ReclaimStats = ReclaimStats {
+    reports: AtomicU64::new(0),
+    released: AtomicU64::new(0),
+    already: AtomicU64::new(0),
+    refaults: AtomicU64::new(0),
+    last_log: Mutex::new(None),
+};
+
+impl ReclaimStats {
+    /// At most every five minutes.
+    fn log_now_and_then(&self) {
+        let mut last = self.last_log.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.duration_since(t).as_secs() < 300) {
+            return;
+        }
+        *last = Some(now);
+        info!(
+            "balloon reclaim: {} reports, {} MiB released, {} MiB already released, {} refaults",
+            self.reports.load(Ordering::Relaxed),
+            self.released.load(Ordering::Relaxed) >> 20,
+            self.already.load(Ordering::Relaxed) >> 20,
+            self.refaults.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// If `pa` falls inside a reclaimed range, remap the whole range and return
@@ -447,6 +557,7 @@ fn balloon_remap_if_reclaimed(pa: u64) -> bool {
         panic!("balloon refault: hv_vm_map(0x{gpa:x}, {len}) failed: {ret:x}");
     }
     map.remove(&gpa);
+    RECLAIM_STATS.refaults.fetch_add(1, Ordering::Relaxed);
     true
 }
 
