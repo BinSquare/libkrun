@@ -21,6 +21,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -334,6 +335,156 @@ struct ReclaimEntry {
 
 static RECLAIMED: OnceLock<Mutex<BTreeMap<u64, ReclaimEntry>>> = OnceLock::new();
 
+/// Guest RAM regions (start -> len), as mapped at VM creation. A fault on guest
+/// RAM is only ever a reclaimed range (see balloon_remap_if_reclaimed).
+static GUEST_RAM: OnceLock<Mutex<BTreeMap<u64, u64>>> = OnceLock::new();
+
+fn guest_ram() -> &'static Mutex<BTreeMap<u64, u64>> {
+    GUEST_RAM.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Record a guest RAM region (called for each region when guest memory is set up).
+pub fn balloon_note_guest_ram(gpa: u64, len: u64) {
+    guest_ram().lock().unwrap().insert(gpa, len);
+}
+
+fn is_guest_ram(pa: u64) -> bool {
+    guest_ram()
+        .lock()
+        .unwrap()
+        .range(..=pa)
+        .next_back()
+        .is_some_and(|(&start, &len)| pa < start + len)
+}
+
+// ---- split host mapping --------------------------------------------------
+//
+// macOS charges a page of guest RAM once for each mapping that holds it: the
+// stage-2 mapping (the guest touched it) and the VMM's own mapping (a device
+// wrote or read it: disk reads into the page cache, network buffers, queues).
+// Pages both sides touched were counted twice in the VMM's footprint, though
+// there is one copy (measured: 512 MiB written by both = 1026 MiB footprint).
+// So the hypervisor maps an alias of guest RAM that the VMM never touches, and
+// the devices' mapping is replaced in place with a fresh alias of the same
+// memory every 30 s: the stale device-side charges go, the data stays (the
+// alias holds it), and the device address never changes. The replacement
+// (mach_vm_remap, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) is atomic: 195,913 of
+// them under three threads touching the memory 2.09 million times, no fault.
+// Opt-in via KRUN_SPLIT_HOST_MAPPING=1.
+
+struct HostAlias {
+    gpa: u64,
+    len: u64,
+    dev: u64,
+    hv: u64,
+}
+
+static ALIASES: Mutex<Vec<HostAlias>> = Mutex::new(Vec::new());
+
+const VM_FLAGS_FIXED: i32 = 0x0000;
+const VM_FLAGS_ANYWHERE: i32 = 0x0001;
+const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+const VM_INHERIT_NONE: u32 = 2;
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_remap(
+        target_task: u32,
+        target_address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        src_task: u32,
+        src_address: u64,
+        copy: i32,
+        cur_protection: *mut i32,
+        max_protection: *mut i32,
+        inheritance: u32,
+    ) -> i32;
+}
+
+fn remap(target: u64, flags: i32, source: u64, len: u64) -> Option<u64> {
+    let (mut addr, mut cur, mut max) = (target, 0i32, 0i32);
+    let kr = unsafe {
+        mach_vm_remap(
+            mach_task_self_,
+            &mut addr,
+            len,
+            0,
+            flags,
+            mach_task_self_,
+            source,
+            0,
+            &mut cur,
+            &mut max,
+            VM_INHERIT_NONE,
+        )
+    };
+    (kr == 0).then_some(addr)
+}
+
+/// Whether the hypervisor maps its own alias of guest RAM (KRUN_SPLIT_HOST_MAPPING=1).
+pub fn split_host_mapping_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KRUN_SPLIT_HOST_MAPPING").is_some_and(|v| v == "1"))
+}
+
+/// The address to hand hv_vm_map for a guest RAM region: an alias of `dev`
+/// (the devices' mapping) when splitting, else `dev` itself.
+pub fn hv_alias_for_region(gpa: u64, dev: u64, len: u64) -> u64 {
+    if !split_host_mapping_enabled() {
+        return dev;
+    }
+    match remap(0, VM_FLAGS_ANYWHERE, dev, len) {
+        Some(hv) => {
+            ALIASES
+                .lock()
+                .unwrap()
+                .push(HostAlias { gpa, len, dev, hv });
+            hv
+        }
+        None => {
+            error!("split host mapping: couldn't alias guest RAM at 0x{gpa:x}; using one mapping");
+            dev
+        }
+    }
+}
+
+/// The hypervisor's host address for a guest RAM address (its alias, when splitting).
+fn hv_host_for(gpa: u64, dev_host: u64) -> u64 {
+    ALIASES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|a| gpa >= a.gpa && gpa < a.gpa + a.len)
+        .map_or(dev_host, |a| a.hv + (gpa - a.gpa))
+}
+
+/// Replaces the devices' mappings of guest RAM with fresh aliases every 30 s.
+pub fn start_host_mapping_refresh() {
+    if !split_host_mapping_enabled() || ALIASES.lock().unwrap().is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("host mapping refresh".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let aliases = ALIASES.lock().unwrap();
+                for a in aliases.iter() {
+                    if remap(a.dev, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, a.hv, a.len) != Some(a.dev)
+                    {
+                        error!(
+                            "split host mapping: couldn't refresh the device mapping at 0x{:x}",
+                            a.gpa
+                        );
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 fn reclaimed_map() -> &'static Mutex<BTreeMap<u64, ReclaimEntry>> {
     RECLAIMED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -362,66 +513,180 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     if end <= start {
         return;
     }
-    let host = host_addr + (start - gpa);
+    // Refaults remap through the hypervisor's own mapping (its alias, when splitting).
+    let host = hv_host_for(start, host_addr + (start - gpa));
     let alen = end - start;
 
     // The lock is held across unmap/insert so a concurrent vCPU refault of a
     // neighboring entry serializes with us.
     let mut map = reclaimed_map().lock().unwrap();
-    // Entries are disjoint; refuse a report overlapping an outstanding entry
-    // (double hv_vm_unmap would fail and split bookkeeping).
-    if map
+    // Outstanding entries this report overlaps. The guest re-reports a block
+    // once it merges with a newly freed buddy, so a report often covers a range
+    // released earlier plus memory freed since: release only the parts not yet
+    // released (a second hv_vm_unmap of a range would fail), then merge it all
+    // into one entry. Refusing the whole report instead left the newly freed
+    // part held by the host for good, since the guest considers it reported.
+    let mut overlapping: Vec<(u64, u64, u64)> = map
         .range(..end)
-        .next_back()
-        .is_some_and(|(&prev_start, prev)| prev_start + prev.len > start)
-    {
-        return;
+        .rev()
+        .take_while(|&(&s, e)| s + e.len > start)
+        .map(|(&s, e)| (s, e.host, e.len))
+        .collect();
+    overlapping.reverse();
+    let mut gaps: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = start;
+    for &(s, _, l) in &overlapping {
+        if s > cursor {
+            gaps.push((cursor, s));
+        }
+        cursor = cursor.max(s + l);
     }
-    let ret = unsafe { hv_vm_unmap(start, alen as usize) };
-    if ret != HV_SUCCESS {
-        error!("balloon reclaim: hv_vm_unmap(0x{start:x}, {alen}) failed: {ret:x}");
-        return;
+    if cursor < end {
+        gaps.push((cursor, end));
     }
-    // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
-    // drops them from phys_footprint immediately.
-    #[cfg(target_os = "macos")]
-    let advice = libc::MADV_FREE_REUSABLE;
-    #[cfg(not(target_os = "macos"))]
-    let advice = libc::MADV_DONTNEED;
-    unsafe { libc::madvise(host as *mut libc::c_void, alen as usize, advice) };
-    map.insert(start, ReclaimEntry { host, len: alen });
+    let mut released: Vec<(u64, u64)> = Vec::new();
+    for &(a, b) in &gaps {
+        let ret = unsafe { hv_vm_unmap(a, (b - a) as usize) };
+        if ret != HV_SUCCESS {
+            error!(
+                "balloon reclaim: hv_vm_unmap(0x{a:x}, {}) failed: {ret:x}",
+                b - a
+            );
+            break;
+        }
+        // With the stage-2 mapping gone nothing pins the pages; MADV_FREE_REUSABLE
+        // drops them from phys_footprint immediately (compressed ones included).
+        #[cfg(target_os = "macos")]
+        let advice = libc::MADV_FREE_REUSABLE;
+        #[cfg(not(target_os = "macos"))]
+        let advice = libc::MADV_DONTNEED;
+        unsafe {
+            libc::madvise(
+                (host + (a - start)) as *mut libc::c_void,
+                (b - a) as usize,
+                advice,
+            )
+        };
+        released.push((a, b));
+    }
+    let freed: u64 = released.iter().map(|&(a, b)| b - a).sum();
+    RECLAIM_STATS.reports.fetch_add(1, Ordering::Relaxed);
+    RECLAIM_STATS.released.fetch_add(freed, Ordering::Relaxed);
+    RECLAIM_STATS.already.fetch_add(
+        alen - gaps.iter().map(|&(a, b)| b - a).sum::<u64>(),
+        Ordering::Relaxed,
+    );
+    if released.len() == gaps.len() {
+        // All of [start, end) is now unmapped, and so are the overlapping
+        // entries: one entry for the union (contiguous, since the report spans
+        // the gaps between them).
+        let (mut ns, mut ne, mut nh) = (start, end, host);
+        if let Some(&(s, h, _)) = overlapping.first()
+            && s < ns
+        {
+            ns = s;
+            nh = h;
+        }
+        if let Some(&(s, _, l)) = overlapping.last() {
+            ne = ne.max(s + l);
+        }
+        for &(s, _, _) in &overlapping {
+            map.remove(&s);
+        }
+        map.insert(
+            ns,
+            ReclaimEntry {
+                host: nh,
+                len: ne - ns,
+            },
+        );
+    } else {
+        // An unmap failed: record what was released, each on its own (they are
+        // disjoint from the outstanding entries by construction).
+        for &(a, b) in &released {
+            map.insert(
+                a,
+                ReclaimEntry {
+                    host: host + (a - start),
+                    len: b - a,
+                },
+            );
+        }
+    }
+    drop(map);
+    RECLAIM_STATS.log_now_and_then();
+}
+
+/// Counters for the libkrun log, to see free-page reclaim at work.
+struct ReclaimStats {
+    reports: AtomicU64,
+    released: AtomicU64,
+    already: AtomicU64,
+    refaults: AtomicU64,
+    last_log: Mutex<Option<std::time::Instant>>,
+}
+
+static RECLAIM_STATS: ReclaimStats = ReclaimStats {
+    reports: AtomicU64::new(0),
+    released: AtomicU64::new(0),
+    already: AtomicU64::new(0),
+    refaults: AtomicU64::new(0),
+    last_log: Mutex::new(None),
+};
+
+impl ReclaimStats {
+    /// At most every five minutes.
+    fn log_now_and_then(&self) {
+        let mut last = self.last_log.lock().unwrap();
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.duration_since(t).as_secs() < 300) {
+            return;
+        }
+        *last = Some(now);
+        info!(
+            "balloon reclaim: {} reports, {} MiB released, {} MiB already released, {} refaults",
+            self.reports.load(Ordering::Relaxed),
+            self.released.load(Ordering::Relaxed) >> 20,
+            self.already.load(Ordering::Relaxed) >> 20,
+            self.refaults.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// If `pa` falls inside a reclaimed range, remap the whole range and return
 /// true so the vCPU retries the faulting instruction. Also covers stage-1
 /// page-table walks that land in reclaimed memory (s1ptw aborts report the
 /// walked PA the same way).
+///
+/// A fault on guest RAM that is no longer in the map was remapped by another
+/// vCPU between this vCPU's fault and now (several vCPUs touching one reclaimed
+/// range at once). It must be retried too: falling through to MMIO dispatch
+/// would emulate a RAM access against an empty bus, so a load returns zero and
+/// a store is dropped, silently corrupting guest memory.
 fn balloon_remap_if_reclaimed(pa: u64) -> bool {
     let mut map = reclaimed_map().lock().unwrap();
-    let (&gpa, entry) = match map.range(..=pa).next_back() {
-        Some(e) => e,
-        None => return false,
+    let (gpa, host, len) = match map.range(..=pa).next_back() {
+        Some((&gpa, entry)) if pa < gpa + entry.len => (gpa, entry.host, entry.len),
+        _ => {
+            drop(map);
+            return is_guest_ram(pa);
+        }
     };
-    if pa >= gpa + entry.len {
-        return false;
-    }
     let ret = unsafe {
         hv_vm_map(
-            entry.host as *mut core::ffi::c_void,
+            host as *mut core::ffi::c_void,
             gpa,
-            entry.len as usize,
+            len as usize,
             (HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC).into(),
         )
     };
     if ret != HV_SUCCESS {
         // Falling through to MMIO dispatch would corrupt the guest; this is
         // unrecoverable state, surface it loudly.
-        panic!(
-            "balloon refault: hv_vm_map(0x{gpa:x}, {}) failed: {ret:x}",
-            entry.len
-        );
+        panic!("balloon refault: hv_vm_map(0x{gpa:x}, {len}) failed: {ret:x}");
     }
     map.remove(&gpa);
+    RECLAIM_STATS.refaults.fetch_add(1, Ordering::Relaxed);
     true
 }
 
