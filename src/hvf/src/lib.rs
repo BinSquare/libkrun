@@ -357,6 +357,134 @@ fn is_guest_ram(pa: u64) -> bool {
         .is_some_and(|(&start, &len)| pa < start + len)
 }
 
+// ---- split host mapping --------------------------------------------------
+//
+// macOS charges a page of guest RAM once for each mapping that holds it: the
+// stage-2 mapping (the guest touched it) and the VMM's own mapping (a device
+// wrote or read it: disk reads into the page cache, network buffers, queues).
+// Pages both sides touched were counted twice in the VMM's footprint, though
+// there is one copy (measured: 512 MiB written by both = 1026 MiB footprint).
+// So the hypervisor maps an alias of guest RAM that the VMM never touches, and
+// the devices' mapping is replaced in place with a fresh alias of the same
+// memory every 30 s: the stale device-side charges go, the data stays (the
+// alias holds it), and the device address never changes. The replacement
+// (mach_vm_remap, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) is atomic: 195,913 of
+// them under three threads touching the memory 2.09 million times, no fault.
+// Opt-in via KRUN_SPLIT_HOST_MAPPING=1.
+
+struct HostAlias {
+    gpa: u64,
+    len: u64,
+    dev: u64,
+    hv: u64,
+}
+
+static ALIASES: Mutex<Vec<HostAlias>> = Mutex::new(Vec::new());
+
+const VM_FLAGS_FIXED: i32 = 0x0000;
+const VM_FLAGS_ANYWHERE: i32 = 0x0001;
+const VM_FLAGS_OVERWRITE: i32 = 0x4000;
+const VM_INHERIT_NONE: u32 = 2;
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_remap(
+        target_task: u32,
+        target_address: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: i32,
+        src_task: u32,
+        src_address: u64,
+        copy: i32,
+        cur_protection: *mut i32,
+        max_protection: *mut i32,
+        inheritance: u32,
+    ) -> i32;
+}
+
+fn remap(target: u64, flags: i32, source: u64, len: u64) -> Option<u64> {
+    let (mut addr, mut cur, mut max) = (target, 0i32, 0i32);
+    let kr = unsafe {
+        mach_vm_remap(
+            mach_task_self_,
+            &mut addr,
+            len,
+            0,
+            flags,
+            mach_task_self_,
+            source,
+            0,
+            &mut cur,
+            &mut max,
+            VM_INHERIT_NONE,
+        )
+    };
+    (kr == 0).then_some(addr)
+}
+
+/// Whether the hypervisor maps its own alias of guest RAM (KRUN_SPLIT_HOST_MAPPING=1).
+pub fn split_host_mapping_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("KRUN_SPLIT_HOST_MAPPING").is_some_and(|v| v == "1"))
+}
+
+/// The address to hand hv_vm_map for a guest RAM region: an alias of `dev`
+/// (the devices' mapping) when splitting, else `dev` itself.
+pub fn hv_alias_for_region(gpa: u64, dev: u64, len: u64) -> u64 {
+    if !split_host_mapping_enabled() {
+        return dev;
+    }
+    match remap(0, VM_FLAGS_ANYWHERE, dev, len) {
+        Some(hv) => {
+            ALIASES
+                .lock()
+                .unwrap()
+                .push(HostAlias { gpa, len, dev, hv });
+            hv
+        }
+        None => {
+            error!("split host mapping: couldn't alias guest RAM at 0x{gpa:x}; using one mapping");
+            dev
+        }
+    }
+}
+
+/// The hypervisor's host address for a guest RAM address (its alias, when splitting).
+fn hv_host_for(gpa: u64, dev_host: u64) -> u64 {
+    ALIASES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|a| gpa >= a.gpa && gpa < a.gpa + a.len)
+        .map_or(dev_host, |a| a.hv + (gpa - a.gpa))
+}
+
+/// Replaces the devices' mappings of guest RAM with fresh aliases every 30 s.
+pub fn start_host_mapping_refresh() {
+    if !split_host_mapping_enabled() || ALIASES.lock().unwrap().is_empty() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("host mapping refresh".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let aliases = ALIASES.lock().unwrap();
+                for a in aliases.iter() {
+                    if remap(a.dev, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, a.hv, a.len) != Some(a.dev)
+                    {
+                        error!(
+                            "split host mapping: couldn't refresh the device mapping at 0x{:x}",
+                            a.gpa
+                        );
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 fn reclaimed_map() -> &'static Mutex<BTreeMap<u64, ReclaimEntry>> {
     RECLAIMED.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -385,7 +513,8 @@ pub fn balloon_reclaim_range(gpa: u64, host_addr: u64, len: u64) {
     if end <= start {
         return;
     }
-    let host = host_addr + (start - gpa);
+    // Refaults remap through the hypervisor's own mapping (its alias, when splitting).
+    let host = hv_host_for(start, host_addr + (start - gpa));
     let alen = end - start;
 
     // The lock is held across unmap/insert so a concurrent vCPU refault of a

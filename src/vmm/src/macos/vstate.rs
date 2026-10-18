@@ -124,14 +124,17 @@ impl Vm {
             if hvf::balloon_reclaim_enabled() {
                 hvf::balloon_note_guest_ram(region.start_addr().raw_value(), region.len());
             }
+            // The hypervisor's own alias when splitting (see hvf::hv_alias_for_region).
+            let hv_addr = hvf::hv_alias_for_region(
+                region.start_addr().raw_value(),
+                host_addr as u64,
+                region.len(),
+            );
             self.hvf_vm
-                .map_memory(
-                    host_addr as u64,
-                    region.start_addr().raw_value(),
-                    region.len(),
-                )
+                .map_memory(hv_addr, region.start_addr().raw_value(), region.len())
                 .map_err(Error::SetUserMemoryRegion)?;
         }
+        hvf::start_host_mapping_refresh();
 
         Ok(())
     }
